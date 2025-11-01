@@ -8,11 +8,13 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const servers = {
   iceServers: [
     { urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+    // Optional TURN server for mobile-to-PC connections across networks
+    // { urls: 'turn:TURN_SERVER_URL', username: 'user', credential: 'pass' }
   ],
   iceCandidatePoolSize: 10,
 };
 
-// Global State
+// Global state
 const pc = new RTCPeerConnection(servers);
 let localStream = null;
 let remoteStream = null;
@@ -53,49 +55,38 @@ callButton.onclick = async () => {
   const callId = genId();
   callInput.value = callId;
 
-  // Create call entry
   await supabase.from('calls').insert([{ id: callId }]);
 
-  // Create offer
   const offerDescription = await pc.createOffer();
   await pc.setLocalDescription(offerDescription);
 
-  const offer = { sdp: offerDescription.sdp, type: offerDescription.type };
-  await supabase.from('calls').update({ offer }).eq('id', callId);
+  await supabase.from('calls').update({ offer: offerDescription.toJSON() }).eq('id', callId);
 
-  // Save ICE candidates
+  // ICE candidates for caller
   pc.onicecandidate = async (event) => {
     if (event.candidate) {
-      await supabase.from('candidates').insert([
-        { call_id: callId, role: 'offer', candidate: event.candidate.toJSON() },
-      ]);
+      await supabase.from('candidates').insert([{ call_id: callId, role: 'offer', candidate: event.candidate.toJSON() }]);
     }
   };
 
-  // Listen for answer
-  supabase
-    .channel('answer-' + callId)
-    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `id=eq.${callId}` },
-      async (payload) => {
-        const data = payload.new;
-        if (data.answer && !pc.currentRemoteDescription) {
-          const answerDescription = new RTCSessionDescription(data.answer);
-          await pc.setRemoteDescription(answerDescription);
-        }
-      })
+  // Listen for answer SDP
+  const answerSub = supabase
+    .from(`calls:id=eq.${callId}`)
+    .on('UPDATE', payload => {
+      const data = payload.new;
+      if (data.answer && !pc.currentRemoteDescription) {
+        pc.setRemoteDescription(data.answer);
+      }
+    })
     .subscribe();
 
   // Listen for answer ICE candidates
-  supabase
-    .channel('answer-candidates-' + callId)
-    .on('postgres_changes', {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'candidates',
-      filter: `call_id=eq.${callId},role=eq.answer`,
-    }, async (payload) => {
-      const candidate = new RTCIceCandidate(payload.new.candidate);
-      await pc.addIceCandidate(candidate);
+  const iceSub = supabase
+    .from(`candidates:call_id=eq.${callId}`)
+    .on('INSERT', payload => {
+      if (payload.new.role === 'answer') {
+        pc.addIceCandidate(new RTCIceCandidate(payload.new.candidate));
+      }
     })
     .subscribe();
 
@@ -107,34 +98,27 @@ answerButton.onclick = async () => {
   const callId = callInput.value;
   const { data: callData } = await supabase.from('calls').select('*').eq('id', callId).single();
 
-  const offerDescription = callData.offer;
-  await pc.setRemoteDescription(new RTCSessionDescription(offerDescription));
+  await pc.setRemoteDescription(callData.offer);
 
   const answerDescription = await pc.createAnswer();
   await pc.setLocalDescription(answerDescription);
 
-  const answer = { type: answerDescription.type, sdp: answerDescription.sdp };
-  await supabase.from('calls').update({ answer }).eq('id', callId);
+  await supabase.from('calls').update({ answer: answerDescription.toJSON() }).eq('id', callId);
 
+  // ICE candidates for answerer
   pc.onicecandidate = async (event) => {
     if (event.candidate) {
-      await supabase.from('candidates').insert([
-        { call_id: callId, role: 'answer', candidate: event.candidate.toJSON() },
-      ]);
+      await supabase.from('candidates').insert([{ call_id: callId, role: 'answer', candidate: event.candidate.toJSON() }]);
     }
   };
 
   // Listen for offer ICE candidates
   supabase
-    .channel('offer-candidates-' + callId)
-    .on('postgres_changes', {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'candidates',
-      filter: `call_id=eq.${callId},role=eq.offer`,
-    }, async (payload) => {
-      const candidate = new RTCIceCandidate(payload.new.candidate);
-      await pc.addIceCandidate(candidate);
+    .from(`candidates:call_id=eq.${callId}`)
+    .on('INSERT', payload => {
+      if (payload.new.role === 'offer') {
+        pc.addIceCandidate(new RTCIceCandidate(payload.new.candidate));
+      }
     })
     .subscribe();
 };
